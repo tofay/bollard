@@ -1,9 +1,9 @@
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 use std::fs;
 use std::future::Future;
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 use std::io;
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -20,16 +20,18 @@ use http::request::Builder;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{self, body::Bytes, Method, Request, Response, StatusCode};
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 #[cfg(unix)]
 use hyperlocal_next::UnixConnector;
 use log::{debug, trace};
-#[cfg(feature = "ssl")]
-use rustls::{crypto::ring::sign::any_supported_type, sign::CertifiedKey, ALL_VERSIONS};
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
+use rustls::crypto::CryptoProvider;
+#[cfg(feature = "ssl-crypto-agnostic")]
+use rustls::{sign::CertifiedKey, ALL_VERSIONS};
+#[cfg(feature = "ssl-crypto-agnostic")]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde_derive::{Deserialize, Serialize};
 use tokio::io::{split, AsyncRead, AsyncWrite};
@@ -81,7 +83,7 @@ pub(crate) enum ClientType {
     #[cfg(unix)]
     Unix,
     Http,
-    #[cfg(feature = "ssl")]
+    #[cfg(feature = "ssl-crypto-agnostic")]
     SSL,
     #[cfg(windows)]
     NamedPipe,
@@ -96,7 +98,7 @@ pub(crate) enum Transport {
     Http {
         client: Client<HttpConnector, Full<Bytes>>,
     },
-    #[cfg(feature = "ssl")]
+    #[cfg(feature = "ssl-crypto-agnostic")]
     Https {
         client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     },
@@ -118,7 +120,7 @@ impl fmt::Debug for Transport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Transport::Http { .. } => write!(f, "HTTP"),
-            #[cfg(feature = "ssl")]
+            #[cfg(feature = "ssl-crypto-agnostic")]
             Transport::Https { .. } => write!(f, "HTTPS(rustls)"),
             #[cfg(unix)]
             Transport::Unix { .. } => write!(f, "Unix"),
@@ -299,14 +301,14 @@ struct DockerServerErrorMessage {
     message: String,
 }
 
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 #[derive(Debug)]
 struct DockerClientCertResolver {
     ssl_key: PathBuf,
     ssl_cert: PathBuf,
 }
 
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 impl DockerClientCertResolver {
     /// The default directory in which to look for our Docker certificate
     /// files.
@@ -354,15 +356,36 @@ impl DockerClientCertResolver {
             });
         };
 
-        let signing_key = any_supported_type(&key).map_err(|_| CertParseError {
-            path: self.ssl_key.to_owned(),
-        })?;
+        let signing_key = get_crypto_provider()
+            .key_provider
+            .load_private_key(key)
+            .map_err(|_| CertParseError {
+                path: self.ssl_key.to_owned(),
+            })?;
 
         Ok(Arc::new(CertifiedKey::new(all_certs, signing_key)))
     }
 }
 
-#[cfg(feature = "ssl")]
+#[cfg(all(feature = "ssl-crypto-agnostic", not(feature = "ssl-aws-lc-crypto")))]
+fn get_crypto_provider() -> &'static Arc<CryptoProvider> {
+    if let Some(cp) = CryptoProvider::get_default() {
+        cp
+    } else {
+        panic!("No crypto provider available. Please enable a crypto provider feature via https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#method.install_default");
+    }
+}
+
+#[cfg(all(feature = "ssl-crypto-agnostic", feature = "ssl-aws-lc-crypto"))]
+fn get_crypto_provider() -> &'static Arc<CryptoProvider> {
+    if let Some(cp) = CryptoProvider::get_default() {
+        cp
+    } else {
+        rustls::crypto::aws_lc_rs::get_crypto_provider()
+    }
+}
+
+#[cfg(feature = "ssl-crypto-agnostic")]
 impl rustls::client::ResolvesClientCert for DockerClientCertResolver {
     fn resolve(&self, _: &[&[u8]], _: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
         self.docker_client_key().ok()
@@ -375,7 +398,7 @@ impl rustls::client::ResolvesClientCert for DockerClientCertResolver {
 
 /// A Docker implementation typed to connect to a secure HTTPS connection using the `rustls`
 /// library.
-#[cfg(feature = "ssl")]
+#[cfg(feature = "ssl-crypto-agnostic")]
 impl Docker {
     /// Connect using secure HTTPS using defaults that are signalled by environment variables.
     ///
@@ -474,15 +497,12 @@ impl Docker {
             rustls_pemfile::certs(&mut ca_pem).collect::<Result<Vec<_>, _>>()?,
         );
 
-        let config = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_protocol_versions(ALL_VERSIONS)?
-        .with_root_certificates(root_store)
-        .with_client_cert_resolver(Arc::new(DockerClientCertResolver {
-            ssl_key: ssl_key.to_owned(),
-            ssl_cert: ssl_cert.to_owned(),
-        }));
+        let config = rustls::ClientConfig::builder_with_protocol_versions(ALL_VERSIONS)
+            .with_root_certificates(root_store)
+            .with_client_cert_resolver(Arc::new(DockerClientCertResolver {
+                ssl_key: ssl_key.to_owned(),
+                ssl_cert: ssl_cert.to_owned(),
+            }));
 
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
@@ -671,13 +691,13 @@ impl Docker {
                 Docker::connect_with_named_pipe(&h, DEFAULT_TIMEOUT, API_DEFAULT_VERSION)
             }
             h if h.starts_with("tcp://") || h.starts_with("http://") => {
-                #[cfg(feature = "ssl")]
+                #[cfg(feature = "ssl-crypto-agnostic")]
                 if env::var("DOCKER_TLS_VERIFY").is_ok() {
                     return Docker::connect_with_ssl_defaults();
                 }
                 Docker::connect_with_http_defaults()
             }
-            #[cfg(feature = "ssl")]
+            #[cfg(feature = "ssl-crypto-agnostic")]
             h if h.starts_with("https://") => Docker::connect_with_ssl_defaults(),
             _ => Err(UnsupportedURISchemeError {
                 uri: host.to_string(),
@@ -1193,7 +1213,7 @@ impl Docker {
         // This is where we determine to which transport we issue the request.
         let request = match *transport {
             Transport::Http { ref client } => client.request(req),
-            #[cfg(feature = "ssl")]
+            #[cfg(feature = "ssl-crypto-agnostic")]
             Transport::Https { ref client } => client.request(req),
             #[cfg(unix)]
             Transport::Unix { ref client } => client.request(req),
